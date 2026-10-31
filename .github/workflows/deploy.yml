@@ -1,0 +1,338 @@
+name: Dispatch trust proof
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  dispatch-proof:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: Staging
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Create synthetic request and dispatch CentralDevOps proof
+        env:
+          DISPATCH_APP_ID: ${{ secrets.DISPATCH_APP_ID }}
+          DISPATCH_APP_PRIVATE_KEY: ${{ secrets.DISPATCH_APP_PRIVATE_KEY }}
+        run: |
+          node <<'NODE'
+          'use strict';
+
+          const crypto = require('node:crypto');
+
+          const TARGET_ENVIRONMENT = 'Staging';
+          const IMAGE_REF = 'ghcr.io/example/synthetic-app@sha256:0000000000000000000000000000000000000000000000000000000000000000';
+          const CENTRAL_REPOSITORY = 'Buzilion/CentralDevOps';
+          const CENTRAL_REF = 'feature/02_dispatch-trust-proof';
+          const API_ROOT = 'https://api.github.com';
+
+          class SafeFailure extends Error {
+            constructor(identifier) {
+              super();
+              this.identifier = identifier;
+            }
+          }
+
+          function fail(identifier) {
+            throw new SafeFailure(identifier);
+          }
+
+          function addMask(value) {
+            const escaped = value
+              .replace(/%/g, '%25')
+              .replace(/\r/g, '%0D')
+              .replace(/\n/g, '%0A');
+            process.stdout.write(`::add-mask::${escaped}\n`);
+          }
+
+          async function readJson(response, failureId) {
+            try {
+              return await response.json();
+            } catch {
+              fail(failureId);
+            }
+          }
+
+          async function getOidcToken(audience) {
+            const requestUrl = process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
+            const requestCredential = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
+            if (!requestUrl || !requestCredential) {
+              fail('OIDC_CONFIGURATION_MISSING');
+            }
+            addMask(requestCredential);
+
+            let url;
+            try {
+              url = new URL(requestUrl);
+            } catch {
+              fail('OIDC_CONFIGURATION_INVALID');
+            }
+            if (
+              url.protocol !== 'https:' ||
+              url.username ||
+              url.password ||
+              (url.hostname !== 'actions.githubusercontent.com' &&
+                !url.hostname.endsWith('.actions.githubusercontent.com'))
+            ) {
+              fail('OIDC_CONFIGURATION_INVALID');
+            }
+            url.searchParams.set('audience', audience);
+
+            let response;
+            try {
+              response = await fetch(url, {
+                headers: {
+                  authorization: `Bearer ${requestCredential}`,
+                  accept: 'application/json',
+                },
+                redirect: 'error',
+                signal: AbortSignal.timeout(15000),
+              });
+            } catch {
+              fail('OIDC_REQUEST_FAILED');
+            }
+            if (response.status !== 200) {
+              fail('OIDC_REQUEST_FAILED');
+            }
+
+            const result = await readJson(response, 'OIDC_RESPONSE_INVALID');
+            const token = result && result.value;
+            if (typeof token !== 'string' || token.length === 0) {
+              fail('OIDC_TOKEN_MISSING');
+            }
+            addMask(token);
+            if (!/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(token)) {
+              fail('OIDC_TOKEN_INVALID');
+            }
+            return token;
+          }
+
+          function createAppJwt(appId, privateKeyText) {
+            let privateKey;
+            try {
+              privateKey = crypto.createPrivateKey(
+                privateKeyText.replace(/\\n/g, '\n'),
+              );
+            } catch {
+              fail('APP_PRIVATE_KEY_INVALID');
+            }
+            if (privateKey.asymmetricKeyType !== 'rsa') {
+              fail('APP_PRIVATE_KEY_INVALID');
+            }
+
+            const now = Math.floor(Date.now() / 1000);
+            const header = Buffer.from(
+              JSON.stringify({ alg: 'RS256', typ: 'JWT' }),
+            ).toString('base64url');
+            const payload = Buffer.from(
+              JSON.stringify({ iat: now - 60, exp: now + 8 * 60, iss: appId }),
+            ).toString('base64url');
+            const unsignedToken = `${header}.${payload}`;
+
+            try {
+              const signer = crypto.createSign('RSA-SHA256');
+              signer.update(unsignedToken, 'utf8');
+              signer.end();
+              return `${unsignedToken}.${signer.sign(privateKey).toString('base64url')}`;
+            } catch {
+              fail('APP_JWT_CREATION_FAILED');
+            }
+          }
+
+          async function githubRequest(
+            method,
+            path,
+            token,
+            body,
+            expectedStatus,
+            failureId,
+          ) {
+            let response;
+            try {
+              response = await fetch(`${API_ROOT}${path}`, {
+                method,
+                headers: {
+                  authorization: `Bearer ${token}`,
+                  accept: 'application/vnd.github+json',
+                  'x-github-api-version': '2022-11-28',
+                  'user-agent': 'dispatch-trust-proof',
+                  ...(body === undefined
+                    ? {}
+                    : { 'content-type': 'application/json' }),
+                },
+                ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+                redirect: 'error',
+                signal: AbortSignal.timeout(15000),
+              });
+            } catch {
+              fail(failureId);
+            }
+            if (response.status !== expectedStatus) {
+              fail(failureId);
+            }
+            return response;
+          }
+
+          function safeRunUrl(location) {
+            if (typeof location !== 'string') {
+              return undefined;
+            }
+            let url;
+            try {
+              url = new URL(location);
+            } catch {
+              return undefined;
+            }
+            if (
+              url.origin !== 'https://github.com' ||
+              url.username ||
+              url.password ||
+              url.search ||
+              url.hash ||
+              !/^\/Buzilion\/CentralDevOps\/actions\/runs\/\d+$/.test(url.pathname)
+            ) {
+              return undefined;
+            }
+            return url.href;
+          }
+
+          async function main() {
+            if (
+              !process.env.DISPATCH_APP_ID ||
+              !/^[0-9]+$/.test(process.env.DISPATCH_APP_ID) ||
+              !process.env.DISPATCH_APP_PRIVATE_KEY
+            ) {
+              fail('APP_CREDENTIALS_MISSING_OR_INVALID');
+            }
+
+            const sealedBundleBytes = crypto.randomBytes(32);
+            const audienceBytes = Buffer.concat([
+              Buffer.from(TARGET_ENVIRONMENT, 'utf8'),
+              Buffer.from([0x7c]),
+              Buffer.from(IMAGE_REF, 'utf8'),
+              Buffer.from([0x7c]),
+              sealedBundleBytes,
+            ]);
+            const audience =
+              'centraldevops-deploy:' +
+              crypto.createHash('sha256').update(audienceBytes).digest('hex');
+            const sealedBundle = sealedBundleBytes.toString('base64');
+            const oidcToken = await getOidcToken(audience);
+
+            const appJwt = createAppJwt(
+              process.env.DISPATCH_APP_ID,
+              process.env.DISPATCH_APP_PRIVATE_KEY,
+            );
+            addMask(appJwt);
+
+            const installationResponse = await githubRequest(
+              'GET',
+              `/repos/${CENTRAL_REPOSITORY}/installation`,
+              appJwt,
+              undefined,
+              200,
+              'APP_INSTALLATION_LOOKUP_FAILED',
+            );
+            const installation = await readJson(
+              installationResponse,
+              'APP_INSTALLATION_RESPONSE_INVALID',
+            );
+            if (
+              !installation ||
+              !Number.isSafeInteger(installation.id) ||
+              installation.id <= 0
+            ) {
+              fail('APP_INSTALLATION_RESPONSE_INVALID');
+            }
+
+            const installationTokenResponse = await githubRequest(
+              'POST',
+              `/app/installations/${installation.id}/access_tokens`,
+              appJwt,
+              {
+                repositories: ['CentralDevOps'],
+                permissions: { actions: 'write' },
+              },
+              201,
+              'INSTALLATION_TOKEN_MINT_FAILED',
+            );
+            const tokenResult = await readJson(
+              installationTokenResponse,
+              'INSTALLATION_TOKEN_RESPONSE_INVALID',
+            );
+            const installationToken = tokenResult && tokenResult.token;
+            if (typeof installationToken !== 'string' || installationToken.length === 0) {
+              fail('INSTALLATION_TOKEN_MISSING');
+            }
+            addMask(installationToken);
+
+            const dispatchStartedAt = Date.now() - 5000;
+            await githubRequest(
+              'POST',
+              `/repos/${CENTRAL_REPOSITORY}/actions/workflows/dispatch-proof.yml/dispatches`,
+              installationToken,
+              {
+                ref: CENTRAL_REF,
+                inputs: {
+                  target_environment: TARGET_ENVIRONMENT,
+                  image_ref: IMAGE_REF,
+                  oidc_token: oidcToken,
+                  sealed_bundle: sealedBundle,
+                },
+              },
+              204,
+              'CENTRAL_DISPATCH_FAILED',
+            );
+
+            const runDeadline = Date.now() + 60000;
+            let runUrl;
+            while (Date.now() < runDeadline && !runUrl) {
+              const runsResponse = await githubRequest(
+                'GET',
+                `/repos/${CENTRAL_REPOSITORY}/actions/workflows/dispatch-proof.yml/runs?branch=${encodeURIComponent(CENTRAL_REF)}&event=workflow_dispatch&per_page=10`,
+                installationToken,
+                undefined,
+                200,
+                'CENTRAL_RUN_LOOKUP_FAILED',
+              );
+              const runList = await readJson(
+                runsResponse,
+                'CENTRAL_RUN_RESPONSE_INVALID',
+              );
+              if (!Array.isArray(runList.workflow_runs)) {
+                fail('CENTRAL_RUN_RESPONSE_INVALID');
+              }
+              const run = runList.workflow_runs.find(
+                (candidate) =>
+                  candidate.event === 'workflow_dispatch' &&
+                  candidate.head_branch === CENTRAL_REF &&
+                  Date.parse(candidate.created_at) >= dispatchStartedAt,
+              );
+              if (run) {
+                runUrl = safeRunUrl(run.html_url);
+              }
+              if (!runUrl) {
+                await new Promise((resolve) => setTimeout(resolve, 2000));
+              }
+            }
+            if (!runUrl) {
+              fail('CENTRAL_RUN_NOT_FOUND');
+            }
+
+            console.log('dispatch-proof: central_dispatch_accepted');
+            console.log(`centraldevops_run_url=${runUrl}`);
+          }
+
+          main().catch((error) => {
+            const identifier =
+              error instanceof SafeFailure
+                ? error.identifier
+                : 'UNEXPECTED_FAILURE';
+            console.error(`dispatch-proof: failed; failure_id=${identifier}`);
+            process.exitCode = 1;
+          });
+          NODE
